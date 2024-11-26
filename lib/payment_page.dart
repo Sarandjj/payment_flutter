@@ -1,10 +1,12 @@
 import 'dart:convert';
-
+import 'dart:developer';
 import 'package:dart_jsonwebtoken/dart_jsonwebtoken.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
-import 'package:flutter_inappwebview/flutter_inappwebview.dart';
 import 'package:http/http.dart' as http;
+import 'package:payment_flutter/peb_view_screen.dart';
+import 'package:pgw_sdk/core/pgw_sdk_delegate.dart';
+import 'package:pgw_sdk/enum/api_response_code.dart';
 
 class PaymentPage extends StatefulWidget {
   final double amount;
@@ -22,45 +24,24 @@ class PaymentPage extends StatefulWidget {
 
 class _PaymentPageState extends State<PaymentPage> {
   bool isLoading = false;
-  String? paymentUrl;
   String? paymentToken;
   String? respCode;
   String? respDesc;
-  final GlobalKey webViewKey = GlobalKey();
-  InAppWebViewController? webViewController;
-  bool showWebView = false; // Add this to control WebView visibility
 
-  double progress = 0;
+  // Form controllers
+  final _cardNumberController = TextEditingController();
+  final _expiryMonthController = TextEditingController();
+  final _expiryYearController = TextEditingController();
+  final _cvvController = TextEditingController();
+  final _formKey = GlobalKey<FormState>();
 
-  @override
   @override
   void initState() {
     super.initState();
-    enableWebViewDebugging();
-    sendPaymentRequest();
+    getPaymentToken();
   }
 
-  Future<void> enableWebViewDebugging() async {
-    // if (WebViewEnvironment.isAndroid) {
-    await InAppWebViewController.setWebContentsDebuggingEnabled(true);
-    // }
-  }
-
-  void _copyToClipboard(String text) {
-    Clipboard.setData(ClipboardData(text: text));
-    ScaffoldMessenger.of(context).showSnackBar(
-      const SnackBar(content: Text('Copied to clipboard')),
-    );
-  }
-
-  // Add this method to handle payment URL opening
-  void _openPaymentUrl() {
-    setState(() {
-      showWebView = true;
-    });
-  }
-
-  Future<void> sendPaymentRequest() async {
+  Future<void> getPaymentToken() async {
     setState(() {
       isLoading = true;
     });
@@ -72,7 +53,7 @@ class _PaymentPageState extends State<PaymentPage> {
       "amount": widget.amount,
       "currencyCode": "IDR",
       "nonceStr": DateTime.now().millisecondsSinceEpoch.toString(),
-      "paymentChannel": ["ALL"]
+      "paymentChannel": ["CC"]
     };
 
     const String merchantKey =
@@ -83,7 +64,6 @@ class _PaymentPageState extends State<PaymentPage> {
       String signedToken =
           jwt.sign(SecretKey(merchantKey), algorithm: JWTAlgorithm.HS256);
 
-      print("signedToken: $signedToken");
       final response = await http.post(
         Uri.parse('https://sandbox-pgw.2c2p.com/payment/4.3/paymentToken'),
         headers: {
@@ -96,40 +76,100 @@ class _PaymentPageState extends State<PaymentPage> {
 
       if (response.statusCode == 200) {
         final jsonResponse = jsonDecode(response.body);
-
-        // Extract the payload from the response
         final responseToken = jsonResponse['payload'] as String;
-        print("responseToken: $responseToken");
+
         final JWT decodedJWT = JWT.verify(
           responseToken,
           SecretKey(merchantKey),
         );
 
-        final extractedPaymentUrl = decodedJWT.payload['webPaymentUrl'];
-        // final paymentToken = decodedJWT.payload['paymentToken'];
-        print(extractedPaymentUrl);
-        final respCode1 = decodedJWT.payload['respCode'];
-        // final respDesc = decodedJWT.payload['respDesc'];
-
-        if (respCode1 == '0000') {
+        if (decodedJWT.payload['respCode'] == '0000') {
           setState(() {
-            paymentUrl = extractedPaymentUrl;
             paymentToken = decodedJWT.payload['paymentToken'];
-            print(paymentToken);
             respDesc = decodedJWT.payload['respDesc'];
-            respCode = decodedJWT.payload['respCode'] ?? '';
+            respCode = decodedJWT.payload['respCode'];
           });
         } else {
-          _showError('Payment token generation failed: $respDesc');
-          print('respCode: $respCode');
+          _showError(
+              'Payment token generation failed: ${decodedJWT.payload['respDesc']}');
         }
-      } else {
-        _showError('Failed to get payment token. Status: ${response.statusCode}');
-        print('respCode: ${response.statusCode}');
       }
     } catch (e) {
       _showError('Error in payment process: $e');
-      print(e);
+    } finally {
+      setState(() {
+        isLoading = false;
+      });
+    }
+  }
+
+  Future<void> processPayment() async {
+    if (!_formKey.currentState!.validate()) return;
+
+    setState(() {
+      isLoading = true;
+    });
+
+    try {
+      // Construct billing address
+      Map<String, dynamic> userAddress = {
+        'billingAddress1': '128 Beach Road',
+        'billingAddress2': '#21-04',
+        'billingAddress3': 'Guoco Midtown',
+        'billingCity': 'Singapore',
+        'billingState': 'Singapore',
+        'billingPostalCode': '189773',
+        'billingCountryCode': 'SG'
+      };
+
+      // Construct payment code
+      Map<String, dynamic> paymentCode = {
+        'channelCode': 'CC',
+      };
+
+      // Construct payment request with card details
+      Map<String, dynamic> paymentRequest = {
+        'cardNo': '4111111111111111',
+        'expiryMonth': 12,
+        'expiryYear': 2026,
+        'securityCode': '123',
+        // ...userAddress
+      };
+
+      // Construct final transaction request
+      Map<String, dynamic> transactionRequest = {
+        'paymentToken': paymentToken,
+        'payment': {'code': paymentCode, 'data': paymentRequest}
+      };
+
+      // Process the payment using SDK with proper error handling
+      PGWSDK().proceedTransaction(transactionRequest, (response) {
+        if (response['responseCode'] == APIResponseCode.transactionAuthenticateRedirect ||
+            response['responseCode'] ==
+                APIResponseCode.transactionAuthenticateFullRedirect) {
+          log('Payment response: $response');
+          // Handle redirect if needed
+          String redirectUrl = response['data'];
+          _navigateToWebView(redirectUrl!);
+          // _handleRedirect(redirectUrl);
+        } else if (response['responseCode'] == APIResponseCode.transactionCompleted) {
+          Navigator.of(context).pop(true); // Success
+        } else {
+          log('Payment response: $response');
+          String errorMessage = response['responseMessage'] ?? 'Payment failed';
+          _showError(errorMessage);
+        }
+      }, (error) {
+        // Handle PlatformException properly
+        if (error is PlatformException) {
+          log('Payment response: ${error.message}');
+          _showError('Payment error: ${error.message}');
+        } else {
+          _showError('An unexpected error occurred: $error');
+        }
+      });
+    } catch (e) {
+      _showError('Error processing payment: $e');
     } finally {
       setState(() {
         isLoading = false;
@@ -155,10 +195,8 @@ class _PaymentPageState extends State<PaymentPage> {
           onPressed: () => Navigator.of(context).pop(false),
         ),
       ),
-      body: Stack(
-        children: [
-          if (isLoading)
-            const Center(
+      body: isLoading
+          ? const Center(
               child: Column(
                 mainAxisAlignment: MainAxisAlignment.center,
                 children: [
@@ -168,169 +206,159 @@ class _PaymentPageState extends State<PaymentPage> {
                 ],
               ),
             )
-          else if (!showWebView && paymentUrl != null)
-            Padding(
+          : SingleChildScrollView(
               padding: const EdgeInsets.all(16.0),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Card(
-                    child: Padding(
-                      padding: const EdgeInsets.all(16.0),
-                      child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: [
-                          const Text(
-                            'Payment Details',
-                            style: TextStyle(
-                              fontSize: 20,
-                              fontWeight: FontWeight.bold,
+              child: Form(
+                key: _formKey,
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  children: [
+                    Card(
+                      child: Padding(
+                        padding: const EdgeInsets.all(16.0),
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Text(
+                              'Amount: ${widget.amount} IDR',
+                              style: const TextStyle(
+                                fontSize: 20,
+                                fontWeight: FontWeight.bold,
+                              ),
                             ),
-                          ),
-                          const Divider(),
-                          const SizedBox(height: 16),
-                          _buildDetailRow('Response Code', respCode ?? ''),
-                          _buildDetailRow('Response Description', respDesc ?? ''),
-                          _buildDetailRow('Payment Token', paymentToken ?? ''),
-                          const SizedBox(height: 16),
-                          const Text(
-                            'Payment URL:',
-                            style: TextStyle(fontWeight: FontWeight.bold),
-                          ),
-                          const SizedBox(height: 8),
-                          Container(
-                            padding: const EdgeInsets.all(8),
-                            decoration: BoxDecoration(
-                              color: Colors.grey[200],
-                              borderRadius: BorderRadius.circular(4),
+                            const SizedBox(height: 24),
+                            TextFormField(
+                              controller: _cardNumberController,
+                              decoration: const InputDecoration(
+                                labelText: 'Card Number',
+                                hintText: '4111 1111 1111 1111',
+                              ),
+                              keyboardType: TextInputType.number,
+                              validator: (value) {
+                                if (value == null || value.isEmpty) {
+                                  return 'Please enter card number';
+                                }
+                                return null;
+                              },
                             ),
-                            child: Row(
+                            const SizedBox(height: 16),
+                            Row(
                               children: [
                                 Expanded(
-                                  child: Text(
-                                    paymentUrl!,
-                                    style: const TextStyle(fontSize: 12),
+                                  child: TextFormField(
+                                    controller: _expiryMonthController,
+                                    decoration: const InputDecoration(
+                                      labelText: 'Month (MM)',
+                                      hintText: '12',
+                                    ),
+                                    keyboardType: TextInputType.number,
+                                    validator: (value) {
+                                      if (value == null || value.isEmpty) {
+                                        return 'Required';
+                                      }
+                                      return null;
+                                    },
                                   ),
                                 ),
-                                IconButton(
-                                  icon: const Icon(Icons.copy),
-                                  onPressed: () => _copyToClipboard(paymentUrl!),
+                                const SizedBox(width: 16),
+                                Expanded(
+                                  child: TextFormField(
+                                    controller: _expiryYearController,
+                                    decoration: const InputDecoration(
+                                      labelText: 'Year (YYYY)',
+                                      hintText: '2026',
+                                    ),
+                                    keyboardType: TextInputType.number,
+                                    validator: (value) {
+                                      if (value == null || value.isEmpty) {
+                                        return 'Required';
+                                      }
+                                      return null;
+                                    },
+                                  ),
                                 ),
                               ],
                             ),
-                          ),
-                        ],
+                            const SizedBox(height: 16),
+                            TextFormField(
+                              controller: _cvvController,
+                              decoration: const InputDecoration(
+                                labelText: 'CVV',
+                                hintText: '123',
+                              ),
+                              keyboardType: TextInputType.number,
+                              obscureText: true,
+                              validator: (value) {
+                                if (value == null || value.isEmpty) {
+                                  return 'Please enter CVV';
+                                }
+                                return null;
+                              },
+                            ),
+                          ],
+                        ),
                       ),
                     ),
-                  ),
-                  const SizedBox(height: 24),
-                  SizedBox(
-                    width: double.infinity,
-                    height: 50,
-                    child: ElevatedButton(
-                      onPressed: _openPaymentUrl,
-                      style: ElevatedButton.styleFrom(
-                        backgroundColor: Colors.blue,
-                        foregroundColor: Colors.white,
+                    const SizedBox(height: 24),
+                    SizedBox(
+                      height: 50,
+                      child: ElevatedButton(
+                        onPressed: processPayment,
+                        style: ElevatedButton.styleFrom(
+                          backgroundColor: Colors.blue,
+                          foregroundColor: Colors.white,
+                        ),
+                        child: const Text('Pay Now'),
                       ),
-                      child: const Text('Proceed to Payment'),
                     ),
-                  ),
-                ],
-              ),
-            )
-          else if (showWebView && paymentUrl != null)
-            Stack(
-              children: [
-                // Update the InAppWebView configuration in your widget:
-                InAppWebView(
-                  key: webViewKey,
-                  initialUrlRequest: URLRequest(
-                    url: WebUri(paymentUrl!),
-                  ),
-                  initialSettings: InAppWebViewSettings(
-                    useShouldOverrideUrlLoading: true,
-                    mediaPlaybackRequiresUserGesture: false,
-                    allowsInlineMediaPlayback: true,
-                    iframeAllow: "camera; microphone",
-                    iframeAllowFullscreen: true,
-                    javaScriptEnabled: true, // Add this
-                    domStorageEnabled: true, // Add this
-                    supportMultipleWindows: true, // Add this
-                    useWideViewPort: true, // Add this
-                    loadWithOverviewMode: true, // Add this
-                  ),
-                  onWebViewCreated: (controller) {
-                    webViewController = controller;
-                  },
-                  onLoadStart: (controller, url) {
-                    debugPrint("Started loading: $url");
-                    setState(() {
-                      progress = 0;
-                    });
-                  },
-                  onLoadStop: (controller, url) async {
-                    debugPrint("Finished loading: $url");
-                    setState(() {
-                      progress = 1.0;
-                    });
+                    const SizedBox(
+                      height: 10,
+                    ),
+                    SizedBox(
+                      height: 50,
+                      child: ElevatedButton(
+                        // onPressed: processPayment,
+                        onPressed: () {
+                          Navigator.of(context).push(
+                            MaterialPageRoute(
+                              builder: (context) => const PGWWebViewScreen(
+                                redirectUrl:
+                                    "https://demo2.2c2p.com/2C2PFrontEnd/storedCardPaymentV2/MPaymentProcess.aspx?token=a8f37a71fb1342e6899de7f3b0b89cc5&ver=2",
+                              ),
+                            ),
+                          );
+                        },
 
-                    if (url.toString().contains('success')) {
-                      Navigator.of(context).pop(true);
-                    } else if (url.toString().contains('failure')) {
-                      Navigator.of(context).pop(false);
-                    }
-                  },
-                  shouldOverrideUrlLoading: (controller, navigationAction) async {
-                    var uri = navigationAction.request.url!;
-                    debugPrint("Override URL: $uri");
-
-                    // Allow all navigation
-                    return NavigationActionPolicy.ALLOW;
-                  },
-                  onProgressChanged: (controller, progress) {
-                    setState(() {
-                      this.progress = progress / 100;
-                    });
-                  },
-                  onLoadError: (controller, url, code, message) {
-                    debugPrint("Load Error: Code: $code, Message: $message");
-                    _showError('Error loading: $message');
-                  },
-                  onLoadHttpError: (controller, url, statusCode, description) {
-                    debugPrint(
-                        "HTTP Error: Status: $statusCode, Description: $description");
-                    _showError('HTTP Error: $description');
-                  },
+                        style: ElevatedButton.styleFrom(
+                          backgroundColor: Colors.blue,
+                          foregroundColor: Colors.white,
+                        ),
+                        child: const Text('Pay Now'),
+                      ),
+                    ),
+                  ],
                 ),
-                if (progress < 1.0) LinearProgressIndicator(value: progress),
-              ],
+              ),
             ),
-        ],
+    );
+  }
+
+  void _navigateToWebView(String redirectUrl) {
+    Navigator.of(context).push(
+      MaterialPageRoute(
+        builder: (context) => PGWWebViewScreen(
+          redirectUrl: redirectUrl,
+        ),
       ),
     );
   }
 
-  Widget _buildDetailRow(String label, String value) {
-    return Padding(
-      padding: const EdgeInsets.symmetric(vertical: 4),
-      child: Row(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          SizedBox(
-            width: 140,
-            child: Text(
-              label,
-              style: const TextStyle(
-                fontWeight: FontWeight.bold,
-              ),
-            ),
-          ),
-          Expanded(
-            child: Text(value),
-          ),
-        ],
-      ),
-    );
+  @override
+  void dispose() {
+    _cardNumberController.dispose();
+    _expiryMonthController.dispose();
+    _expiryYearController.dispose();
+    _cvvController.dispose();
+    super.dispose();
   }
 }
